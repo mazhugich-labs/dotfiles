@@ -1,0 +1,5 @@
+result
+result-*
+*.hm-backup-*
+.DS_Store
+.versions.env.*

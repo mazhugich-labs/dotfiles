@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=lib/platform.sh
+. "$ROOT/lib/platform.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: ./dev-env <command> [options]
+
+Commands:
+  bootstrap [--dry-run]  Install Nix, apply the environment, and select Zsh
+  rebuild                Apply the locked packages, configs, and Hermes release
+  update                 Update every package and Neovim plugin, then rebuild
+  generations            List saved Home Manager generations
+  rollback               Activate the previous Home Manager generation
+  check                  Run local tests and evaluate the Nix configuration
+  versions               Print the versions currently selected on PATH
+EOF
+}
+
+configured_user() {
+  sed -nE 's/^[[:space:]]*username = "([^"]+)";.*/\1/p' "$ROOT/settings.nix" | head -n 1
+}
+
+verify_user() {
+  local expected actual
+  expected="$(configured_user)"
+  actual="$(id -un)"
+  if [ -z "$expected" ]; then
+    printf '%s\n' 'Could not read username from settings.nix.' >&2
+    exit 1
+  fi
+  if [ "$expected" != "$actual" ]; then
+    printf 'settings.nix names user "%s", but the current user is "%s".\n' \
+      "$expected" "$actual" >&2
+    printf '%s\n' 'Edit settings.nix and run the command again.' >&2
+    exit 1
+  fi
+}
+
+link_checkout() {
+  local target="$HOME/.dotfiles"
+  if [ -e "$target" ] && [ ! -L "$target" ]; then
+    printf '%s exists and is not a symlink; move it aside first.\n' "$target" >&2
+    exit 1
+  fi
+  ln -sfn "$ROOT" "$target"
+}
+
+load_nix() {
+  if command -v nix >/dev/null 2>&1; then
+    return
+  fi
+  if [ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
+    # shellcheck disable=SC1091
+    . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+  fi
+  if ! command -v nix >/dev/null 2>&1; then
+    printf '%s\n' 'Nix is missing; run ./dev-env bootstrap first.' >&2
+    exit 1
+  fi
+}
+
+switch_home() {
+  local system backup_suffix
+  system="$(dotfiles_system)"
+  backup_suffix="hm-backup-$(date +%Y%m%d%H%M%S)-$$"
+  nix run "path:$ROOT#home-manager" -- \
+    switch -b "$backup_suffix" --flake "path:$ROOT#$system"
+}
+
+home_manager() {
+  nix run "path:$ROOT#home-manager" -- "$@"
+}
+
+bootstrap() {
+  local dry_run=false
+  if [ "${1:-}" = "--dry-run" ]; then
+    dry_run=true
+  elif [ "$#" -ne 0 ]; then
+    printf 'Usage: ./dev-env bootstrap [--dry-run]\n' >&2
+    exit 2
+  fi
+
+  dotfiles_os >/dev/null
+  verify_user
+  printf 'Target: %s for %s\n' "$(dotfiles_system)" "$(id -un)"
+
+  if [ "$dry_run" = true ]; then
+    if command -v nix >/dev/null 2>&1; then
+      printf '%s\n' 'Nix is already installed.'
+    else
+      # shellcheck source=versions.env
+      # shellcheck disable=SC1091
+      . "$ROOT/versions.env"
+      printf 'Would install curl if needed, then install verified Determinate Nix %s.\n' \
+        "$NIX_INSTALLER_VERSION"
+    fi
+    printf 'Would link %s to %s.\n' "$HOME/.dotfiles" "$ROOT"
+    printf '%s\n' 'Would apply the locked Home Manager generation.'
+    "$ROOT/scripts/install-hermes.sh" --dry-run
+    "$ROOT/scripts/set-default-shell.sh" --dry-run 2>/dev/null || \
+      printf '%s\n' 'Would set the newly installed Zsh as the login shell.'
+    return
+  fi
+
+  if ! command -v nix >/dev/null 2>&1; then
+    if ! command -v curl >/dev/null 2>&1; then
+      sudo apt-get update
+      sudo apt-get install -y curl ca-certificates
+    fi
+    # shellcheck source=versions.env
+    # shellcheck disable=SC1091
+    . "$ROOT/versions.env"
+    local installer_arch installer_dir installer_sha256 installer_url system
+    system="$(dotfiles_system)"
+    case "$system" in
+      x86_64-linux)
+        installer_arch=x86_64-linux
+        installer_sha256="$NIX_INSTALLER_SHA256_X86_64"
+        ;;
+      aarch64-linux)
+        installer_arch=aarch64-linux
+        installer_sha256="$NIX_INSTALLER_SHA256_AARCH64"
+        ;;
+    esac
+    case "$NIX_INSTALLER_VERSION" in
+      v[0-9]*.[0-9]*.[0-9]*) ;;
+      *) printf 'Invalid Nix installer version: %s\n' "$NIX_INSTALLER_VERSION" >&2; exit 1 ;;
+    esac
+    case "$installer_sha256" in
+      *[!0-9a-f]*|'') printf '%s\n' 'Invalid Nix installer checksum.' >&2; exit 1 ;;
+    esac
+    if [ "${#installer_sha256}" -ne 64 ]; then
+      printf '%s\n' 'Invalid Nix installer checksum length.' >&2
+      exit 1
+    fi
+
+    printf 'Installing Determinate Nix %s...\n' "$NIX_INSTALLER_VERSION"
+    installer_dir="$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-nix.XXXXXX")"
+    cleanup() { rm -rf "$installer_dir"; }
+    trap cleanup EXIT HUP INT TERM
+    installer_url="https://install.determinate.systems/nix/tag/$NIX_INSTALLER_VERSION/nix-installer-$installer_arch"
+    curl --proto '=https' --tlsv1.2 -fsSL \
+      "$installer_url" -o "$installer_dir/nix-installer"
+    printf '%s  %s\n' "$installer_sha256" "$installer_dir/nix-installer" | sha256sum -c -
+    chmod u+x "$installer_dir/nix-installer"
+    "$installer_dir/nix-installer" install --no-confirm
+    cleanup
+    trap - EXIT HUP INT TERM
+  fi
+
+  load_nix
+  link_checkout
+  switch_home
+  "$ROOT/scripts/install-hermes.sh"
+  "$ROOT/scripts/set-default-shell.sh"
+  printf '%s\n' 'Bootstrap complete. Log out and back in once to use Zsh everywhere.'
+}
+
+rebuild() {
+  dotfiles_os >/dev/null
+  verify_user
+  load_nix
+  link_checkout
+  switch_home
+  "$ROOT/scripts/install-hermes.sh"
+}
+
+list_generations() {
+  load_nix
+  home_manager generations
+}
+
+rollback() {
+  dotfiles_os >/dev/null
+  verify_user
+  load_nix
+  printf '%s\n' 'Activating the previous Home Manager generation...'
+  home_manager switch --rollback
+  printf '%s\n' 'Rollback complete. Start a new shell to refresh command lookup and environment variables.'
+}
+
+update_all() {
+  local current_commit current_hermes latest_commit latest_hermes release_json version_file version_tmp
+  dotfiles_os >/dev/null
+  verify_user
+  load_nix
+  link_checkout
+
+  printf '%s\n' 'Checking the latest stable Hermes Agent release...'
+  # shellcheck source=versions.env
+  # shellcheck disable=SC1091
+  . "$ROOT/versions.env"
+  current_hermes="$HERMES_VERSION"
+  current_commit="$HERMES_COMMIT"
+  release_json="$(curl -fsSL \
+    https://api.github.com/repos/NousResearch/hermes-agent/releases/latest)"
+  latest_hermes="$(printf '%s' "$release_json" | jq -er '.tag_name')"
+  case "$latest_hermes" in
+    v[0-9]*.[0-9]*.[0-9]*) ;;
+    *) printf 'Unexpected Hermes release tag: %s\n' "$latest_hermes" >&2; exit 1 ;;
+  esac
+  latest_commit="$(git ls-remote https://github.com/NousResearch/hermes-agent.git \
+    "refs/tags/$latest_hermes^{}" | awk 'NR == 1 { print $1 }')"
+  if [ -z "$latest_commit" ]; then
+    latest_commit="$(git ls-remote https://github.com/NousResearch/hermes-agent.git \
+      "refs/tags/$latest_hermes" | awk 'NR == 1 { print $1 }')"
+  fi
+  case "$latest_commit" in
+    *[!0-9a-f]*|'') printf 'Invalid Hermes release commit.\n' >&2; exit 1 ;;
+  esac
+  if [ "${#latest_commit}" -ne 40 ]; then
+    printf 'Invalid Hermes release commit length.\n' >&2
+    exit 1
+  fi
+  if [ "$latest_hermes" != "$current_hermes" ] || [ "$latest_commit" != "$current_commit" ]; then
+    printf 'Hermes Agent: %s -> %s\n' "$current_hermes" "$latest_hermes"
+    version_file="$ROOT/versions.env"
+    version_tmp="$(mktemp "$ROOT/.versions.env.XXXXXX")"
+    sed -E \
+      -e "s/^HERMES_VERSION=.*/HERMES_VERSION=$latest_hermes/" \
+      -e "s/^HERMES_COMMIT=.*/HERMES_COMMIT=$latest_commit/" \
+      "$version_file" > "$version_tmp"
+    mv "$version_tmp" "$version_file"
+  else
+    printf 'Hermes Agent is already pinned to %s.\n' "$current_hermes"
+  fi
+
+  printf '%s\n' 'Updating the Nix lock file...'
+  nix flake update --flake "path:$ROOT"
+  switch_home
+  "$ROOT/scripts/install-hermes.sh"
+
+  printf '%s\n' 'Updating Neovim plugins and their lock file...'
+  "$HOME/.nix-profile/bin/nvim" --headless "+Lazy! sync" +qa
+
+  printf '%s\n' 'Update complete. Review and commit flake.lock and lazy-lock.json.'
+  git -C "$ROOT" status --short
+}
+
+versions() {
+  local tool
+  for tool in wezterm nvim herdr codex hermes zsh; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      case "$tool" in
+        nvim) nvim --version | head -n 1 ;;
+        hermes) hermes --version | head -n 1 ;;
+        *) "$tool" --version | head -n 1 ;;
+      esac
+    else
+      printf '%s: not found\n' "$tool"
+    fi
+  done
+}
+
+command="${1:-}"
+if [ "$#" -gt 0 ]; then shift; fi
+case "$command" in
+  bootstrap) bootstrap "$@" ;;
+  rebuild) [ "$#" -eq 0 ] || { usage >&2; exit 2; }; rebuild ;;
+  update) [ "$#" -eq 0 ] || { usage >&2; exit 2; }; update_all ;;
+  generations) [ "$#" -eq 0 ] || { usage >&2; exit 2; }; list_generations ;;
+  rollback) [ "$#" -eq 0 ] || { usage >&2; exit 2; }; rollback ;;
+  check)
+    [ "$#" -eq 0 ] || { usage >&2; exit 2; }
+    load_nix
+    "$ROOT/tests/smoke.sh"
+    nix flake check "path:$ROOT" --all-systems --no-build
+    ;;
+  versions) [ "$#" -eq 0 ] || { usage >&2; exit 2; }; versions ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
